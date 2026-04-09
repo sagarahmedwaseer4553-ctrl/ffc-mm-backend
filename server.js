@@ -30,7 +30,7 @@ mongoose.connect(process.env.MONGODB_URI, {
 
 // Models Import
 const Complaint = require('./models/Complaint');
-const AdminUser = require('./models/AdminUser');
+const AdminUser = null; // not used
 const EmailConfig = require('./models/EmailConfig');
 
 // Routes
