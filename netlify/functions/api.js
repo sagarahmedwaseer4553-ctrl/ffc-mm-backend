@@ -6,8 +6,30 @@ const nodemailer = require('nodemailer');
 
 const app = express();
 
-app.use(cors({ origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }));
-app.use(express.json());
+// ─── CRITICAL FIX 1 — CORS ───────────────────────────────────────────────────
+// FRONTEND_URL env var is "https://canteens-ffcmm.netlify.app/" (trailing slash).
+// The cors package does an EXACT string match against the browser's Origin header.
+// Browsers send Origin WITHOUT a trailing slash: "https://canteens-ffcmm.netlify.app"
+// So the match was FAILING → every preflight was rejected → ALL requests blocked.
+// Fix: strip trailing slashes before passing to cors().
+// ─────────────────────────────────────────────────────────────────────────────
+const _frontendOrigin = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
+
+app.use(cors({
+  origin: [
+    _frontendOrigin,
+    'http://localhost:3000',          // local dev
+    'https://canteens-ffcmm.netlify.app'  // hard-coded fallback in case env is wrong
+  ],
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'adminpin', 'AdminPin', 'admin-pin', 'Admin-Pin']
+}));
+
+// Handle OPTIONS preflight for all routes
+app.options('*', cors());
+
+app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // ── DB ────────────────────────────────────────────────────
@@ -75,35 +97,40 @@ app.use(async (req, res, next) => {
 });
 
 // ── Constants ─────────────────────────────────────────────
-// These are hardcoded — never rely on env for superadmin credentials
 const PERMANENT_USER = 'kingsman';
 const PERMANENT_PIN  = '1920';
 const ADMIN_EMAIL    = 'sagarahmedwaseer4553@gmail.com';
 
+// ─── CRITICAL FIX 2 — ROUTE PATH NORMALISATION ───────────────────────────────
+// Netlify redirects: from="/api/*" to="/.netlify/functions/api/:splat"
+// Depending on serverless-http version, Express may see the path with OR without
+// the /api prefix.  We register BOTH so it always works:
+//   /api/complaints  (original path preserved by some serverless-http versions)
+//   /complaints      (splat only, passed by other versions)
+// ─────────────────────────────────────────────────────────────────────────────
+function route(path) {
+  // path must start with /api/... — we also register the version without /api
+  const withoutPrefix = path.replace(/^\/api/, '') || '/';
+  return [path, withoutPrefix];
+}
+
 /*
  * THE CORE AUTH FUNCTION
- * Accepts a single PIN and checks ALL valid sources.
- * No username required for header-based dashboard auth.
- * Username only used for login to determine super-admin status.
  */
 async function isPinValid(pin) {
   const p = String(pin || '').trim();
   if (!p) return false;
 
-  // 1. Kingsman permanent PIN
   if (p === PERMANENT_PIN) return true;
 
-  // 2. Env ADMIN_PIN (legacy)
   const envPin = String(process.env.ADMIN_PIN || '').trim();
   if (envPin && p === envPin) return true;
 
-  // 3. DB override PIN (set via forgot-pin)
   try {
     const cfg = await EmailConfig.findOne();
     if (cfg && cfg.adminPinOverride && p === String(cfg.adminPinOverride).trim()) return true;
   } catch (e) { /* ignore */ }
 
-  // 4. Sub-user PIN (any sub-user's PIN works for dashboard access)
   try {
     const sub = await SubUser.findOne({ pin: p });
     if (sub) return true;
@@ -112,11 +139,6 @@ async function isPinValid(pin) {
   return false;
 }
 
-/*
- * LOGIN VERIFICATION
- * Returns { valid, isSuperAdmin }
- * Checks username+pin combo to determine role.
- */
 async function verifyLogin(pin, username) {
   const p = String(pin || '').trim();
   const u = String(username || '').trim().toLowerCase();
@@ -162,14 +184,14 @@ function getHeaderPin(req) {
 // ══════════════════════════════════════════════════════════
 // HEALTH
 // ══════════════════════════════════════════════════════════
-app.get('/api/health', (req, res) => {
+app.get(route('/api/health'), (req, res) => {
   res.json({ status: 'Server running ✅', timestamp: new Date().toISOString() });
 });
 
 // ══════════════════════════════════════════════════════════
-// COMPLAINTS — public read, pin-protected write
+// COMPLAINTS
 // ══════════════════════════════════════════════════════════
-app.post('/api/complaints', async (req, res) => {
+app.post(route('/api/complaints'), async (req, res) => {
   try {
     const { fullName, personalNumber, designation, department,
             mobileNumber, complaintDetails, canteen, imageUrl, videoUrl } = req.body;
@@ -199,7 +221,7 @@ app.post('/api/complaints', async (req, res) => {
   }
 });
 
-app.get('/api/complaints', async (req, res) => {
+app.get(route('/api/complaints'), async (req, res) => {
   try {
     const { canteen, status, searchTerm } = req.query;
     let query = {};
@@ -214,7 +236,7 @@ app.get('/api/complaints', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error fetching complaints' }); }
 });
 
-app.get('/api/complaints/:id', async (req, res) => {
+app.get(route('/api/complaints/:id'), async (req, res) => {
   try {
     const c = await Complaint.findById(req.params.id);
     if (!c) return res.status(404).json({ error: 'Not found' });
@@ -222,7 +244,7 @@ app.get('/api/complaints/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error fetching complaint' }); }
 });
 
-app.put('/api/complaints/:id', async (req, res) => {
+app.put(route('/api/complaints/:id'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
@@ -247,7 +269,7 @@ app.put('/api/complaints/:id', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error updating complaint' }); }
 });
 
-app.delete('/api/complaints/:id', async (req, res) => {
+app.delete(route('/api/complaints/:id'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
@@ -260,7 +282,7 @@ app.delete('/api/complaints/:id', async (req, res) => {
 // ══════════════════════════════════════════════════════════
 // ADMIN LOGIN
 // ══════════════════════════════════════════════════════════
-app.post('/api/admin/verify-pin', async (req, res) => {
+app.post(route('/api/admin/verify-pin'), async (req, res) => {
   try {
     const { pin, username } = req.body;
     console.log(`Login attempt — user:"${username}" pin:"${pin}"`);
@@ -282,7 +304,7 @@ app.post('/api/admin/verify-pin', async (req, res) => {
 // ══════════════════════════════════════════════════════════
 // ADMIN STATS
 // ══════════════════════════════════════════════════════════
-app.get('/api/admin/stats', async (req, res) => {
+app.get(route('/api/admin/stats'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
@@ -308,7 +330,7 @@ app.get('/api/admin/stats', async (req, res) => {
 // ══════════════════════════════════════════════════════════
 // EMAIL CONFIG
 // ══════════════════════════════════════════════════════════
-app.get('/api/admin/email-config', async (req, res) => {
+app.get(route('/api/admin/email-config'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
@@ -319,7 +341,7 @@ app.get('/api/admin/email-config', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error fetching email config' }); }
 });
 
-app.put('/api/admin/email-config', async (req, res) => {
+app.put(route('/api/admin/email-config'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
@@ -336,7 +358,7 @@ app.put('/api/admin/email-config', async (req, res) => {
 // ══════════════════════════════════════════════════════════
 // SUB-USER MANAGEMENT
 // ══════════════════════════════════════════════════════════
-app.get('/api/admin/users', async (req, res) => {
+app.get(route('/api/admin/users'), async (req, res) => {
   try {
     const { pin, username } = req.query;
     const result = await verifyLogin(pin, username);
@@ -347,7 +369,7 @@ app.get('/api/admin/users', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error fetching users' }); }
 });
 
-app.post('/api/admin/users', async (req, res) => {
+app.post(route('/api/admin/users'), async (req, res) => {
   try {
     const { pin, username, newUsername, newPin } = req.body;
     const result = await verifyLogin(pin, username);
@@ -376,7 +398,7 @@ app.post('/api/admin/users', async (req, res) => {
   }
 });
 
-app.delete('/api/admin/users/:target', async (req, res) => {
+app.delete(route('/api/admin/users/:target'), async (req, res) => {
   try {
     const { pin, username } = req.body;
     const result = await verifyLogin(pin, username);
@@ -416,7 +438,7 @@ async function generateAndSendOtp() {
   return true;
 }
 
-app.post('/api/admin/forgot-pin', async (req, res) => {
+app.post(route('/api/admin/forgot-pin'), async (req, res) => {
   try {
     await generateAndSendOtp();
     res.json({ success: true, message: `Code sent to ${ADMIN_EMAIL}` });
@@ -426,7 +448,7 @@ app.post('/api/admin/forgot-pin', async (req, res) => {
   }
 });
 
-app.post('/api/admin/verify-otp', async (req, res) => {
+app.post(route('/api/admin/verify-otp'), async (req, res) => {
   try {
     const { otp } = req.body;
     const record  = await OTP.findOne({ code: String(otp).trim(), used: false });
@@ -438,7 +460,7 @@ app.post('/api/admin/verify-otp', async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error verifying OTP' }); }
 });
 
-app.post('/api/admin/reset-pin', async (req, res) => {
+app.post(route('/api/admin/reset-pin'), async (req, res) => {
   try {
     const { otp, newPin } = req.body;
     if (!otp || !newPin)           return res.status(400).json({ error: 'OTP and new PIN required' });
