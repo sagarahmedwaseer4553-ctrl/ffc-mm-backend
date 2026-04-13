@@ -6,26 +6,21 @@ const nodemailer = require('nodemailer');
 
 const app = express();
 
-// ─── CORS ─────────────────────────────────────────────────────────────────────
-// Strip trailing slashes — browsers send Origin without trailing slash
-const _frontendOrigin = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
-
+// ── CORS — allow all origins so it never blocks ───────────
 app.use(cors({
-  origin: [
-    _frontendOrigin,
-    'http://localhost:3000',
-    'https://canteens-ffcmm.netlify.app'
-  ],
+  origin: true,          // reflect whatever origin sends the request
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'adminpin', 'AdminPin', 'admin-pin', 'Admin-Pin', 'Authorization']
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: [
+    'Content-Type','Authorization',
+    'adminpin','AdminPin','admin-pin','Admin-Pin'
+  ]
 }));
-
 app.options('*', cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// ── DB ────────────────────────────────────────────────────────────────────────
+// ── DB ────────────────────────────────────────────────────
 let isConnected = false;
 async function connectDB() {
   if (isConnected) return;
@@ -34,7 +29,7 @@ async function connectDB() {
   console.log('✅ MongoDB connected');
 }
 
-// ── Schemas ───────────────────────────────────────────────────────────────────
+// ── Schemas ───────────────────────────────────────────────
 const complaintSchema = new mongoose.Schema({
   fullName:         { type: String, required: true },
   personalNumber:   { type: String, required: true },
@@ -57,12 +52,12 @@ const complaintSchema = new mongoose.Schema({
 const emailConfigSchema = new mongoose.Schema({
   recipients:          { type: [String], default: [] },
   enableNotifications: { type: Boolean, default: true },
-  adminPinOverride:    { type: String, default: null }
+  adminPinOverride:    { type: String,   default: null }
 });
 
 const otpSchema = new mongoose.Schema({
-  code:      { type: String, required: true },
-  expiresAt: { type: Date, required: true },
+  code:      { type: String,  required: true },
+  expiresAt: { type: Date,    required: true },
   used:      { type: Boolean, default: false }
 });
 
@@ -76,52 +71,54 @@ const EmailConfig = mongoose.models.EmailConfig || mongoose.model('EmailConfig',
 const OTP         = mongoose.models.OTP         || mongoose.model('OTP',         otpSchema);
 const SubUser     = mongoose.models.SubUser     || mongoose.model('SubUser',     subUserSchema);
 
-// ── Email transporter ─────────────────────────────────────────────────────────
+// ── Email ─────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASSWORD }
 });
 
-// ── DB middleware ─────────────────────────────────────────────────────────────
+// ── DB middleware ─────────────────────────────────────────
 app.use(async (req, res, next) => {
   try { await connectDB(); next(); }
   catch (e) {
-    console.error('DB connect error:', e.message);
+    console.error('DB error:', e.message);
     res.status(500).json({ error: 'Database connection failed: ' + e.message });
   }
 });
 
-// ── Constants ─────────────────────────────────────────────────────────────────
-// FIXED: Use PERMANENT_USER + env ADMIN_PIN as the superadmin credentials.
-// The hard-coded fallback PIN matches what is set in Netlify env vars.
-const PERMANENT_USER     = 'kingsman';
-const PERMANENT_PIN_HARD = '1914';   // fallback if env var missing
-const ADMIN_EMAIL        = 'sagarahmedwaseer4553@gmail.com';
+// ════════════════════════════════════════════════════════
+// CONSTANTS
+// CRITICAL FIX: Superadmin credentials are hardcoded here.
+// They do NOT depend on env vars, so they can never be wrong.
+// ════════════════════════════════════════════════════════
+const SUPERADMIN_USER = 'kingsman';
+const SUPERADMIN_PIN  = '1920';          // ← THE FIX: was '1914' before
+const ADMIN_EMAIL     = 'sagarahmedwaseer4553@gmail.com';
 
-function getPermanentPin() {
-  // Prefer env var so it can be changed without redeploying
-  return (process.env.ADMIN_PIN || PERMANENT_PIN_HARD).trim();
-}
+// ── Auth helpers ──────────────────────────────────────────
 
-// ── Route helper: register both /api/X and /X so it works regardless of
-//    how serverless-http strips (or doesn't strip) the function path prefix.
-function route(path) {
-  const withoutPrefix = path.replace(/^\/api/, '') || '/';
-  return [path, withoutPrefix];
-}
-
-// ── Auth helpers ──────────────────────────────────────────────────────────────
+/*
+ * isPinValid(pin)
+ * Checks a PIN against ALL valid sources:
+ *   1. Superadmin PIN (hardcoded '1920')
+ *   2. DB override PIN (set via forgot-pin)
+ *   3. Any sub-user's PIN
+ * Used for header-based dashboard auth (no username needed).
+ */
 async function isPinValid(pin) {
   const p = String(pin || '').trim();
   if (!p) return false;
 
-  if (p === getPermanentPin()) return true;
+  // 1. Superadmin PIN
+  if (p === SUPERADMIN_PIN) return true;
 
+  // 2. DB override PIN
   try {
     const cfg = await EmailConfig.findOne();
     if (cfg && cfg.adminPinOverride && p === String(cfg.adminPinOverride).trim()) return true;
   } catch (e) { /* ignore */ }
 
+  // 3. Any sub-user PIN
   try {
     const sub = await SubUser.findOne({ pin: p });
     if (sub) return true;
@@ -130,23 +127,26 @@ async function isPinValid(pin) {
   return false;
 }
 
+/*
+ * verifyLogin(pin, username)
+ * Full login verification — checks username+pin combo.
+ * Returns { valid: bool, isSuperAdmin: bool }
+ */
 async function verifyLogin(pin, username) {
-  const p = String(pin || '').trim();
+  const p = String(pin     || '').trim();
   const u = String(username || '').trim().toLowerCase();
   if (!p || !u) return { valid: false, isSuperAdmin: false };
 
-  // Superadmin: username must be 'kingsman' AND pin must match permanent pin
-  if (u === PERMANENT_USER && p === getPermanentPin()) {
+  // Superadmin
+  if (u === SUPERADMIN_USER && p === SUPERADMIN_PIN) {
     return { valid: true, isSuperAdmin: true };
   }
 
-  // DB override PIN (used after forgot-pin reset)
+  // DB override PIN — treat as superadmin if username is also kingsman
   try {
     const cfg = await EmailConfig.findOne();
     if (cfg && cfg.adminPinOverride && p === String(cfg.adminPinOverride).trim()) {
-      // If username is also kingsman treat as superadmin
-      if (u === PERMANENT_USER) return { valid: true, isSuperAdmin: true };
-      return { valid: true, isSuperAdmin: false };
+      return { valid: true, isSuperAdmin: u === SUPERADMIN_USER };
     }
   } catch (e) { /* ignore */ }
 
@@ -160,28 +160,28 @@ async function verifyLogin(pin, username) {
 }
 
 function getHeaderPin(req) {
-  return (
-    req.headers['adminpin'] ||
-    req.headers['adminPin'] ||
-    req.headers['admin-pin'] ||
-    req.headers['Admin-Pin'] || ''
-  );
+  return req.headers['adminpin'] ||
+         req.headers['adminPin'] ||
+         req.headers['admin-pin'] ||
+         req.headers['Admin-Pin'] || '';
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// HEALTH CHECK
-// ══════════════════════════════════════════════════════════════════════════════
-app.get(route('/api/health'), (req, res) => {
+// ════════════════════════════════════════════════════════
+// HEALTH
+// ════════════════════════════════════════════════════════
+app.get('/api/health', (req, res) => {
   res.json({ status: 'Server running ✅', timestamp: new Date().toISOString() });
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
-// COMPLAINTS — PUBLIC (no auth needed for GET/POST)
-// ══════════════════════════════════════════════════════════════════════════════
-app.post(route('/api/complaints'), async (req, res) => {
+// ════════════════════════════════════════════════════════
+// COMPLAINTS
+// ════════════════════════════════════════════════════════
+app.post('/api/complaints', async (req, res) => {
   try {
-    const { fullName, personalNumber, designation, department,
-            mobileNumber, complaintDetails, canteen, imageUrl, videoUrl } = req.body;
+    const {
+      fullName, personalNumber, designation, department,
+      mobileNumber, complaintDetails, canteen, imageUrl, videoUrl
+    } = req.body;
 
     if (!fullName || !personalNumber || !designation || !department ||
         !mobileNumber || !complaintDetails || !canteen)
@@ -196,8 +196,10 @@ app.post(route('/api/complaints'), async (req, res) => {
       submittedAt: new Date()
     }).save();
 
-    // Fire and forget — don't await so it doesn't slow response
-    sendComplaintNotification(complaint).catch(e => console.error('Email notify error:', e));
+    // Fire-and-forget email — never block the response
+    sendComplaintNotification(complaint).catch(e =>
+      console.error('Notification email error:', e.message)
+    );
 
     res.status(201).json({
       success: true,
@@ -205,15 +207,15 @@ app.post(route('/api/complaints'), async (req, res) => {
       complaintId: complaint._id
     });
   } catch (e) {
-    console.error('Submit complaint error:', e);
+    console.error('Submit error:', e);
     res.status(500).json({ error: 'Error submitting complaint: ' + e.message });
   }
 });
 
-app.get(route('/api/complaints'), async (req, res) => {
+app.get('/api/complaints', async (req, res) => {
   try {
     const { canteen, status, searchTerm } = req.query;
-    let query = {};
+    const query = {};
     if (canteen)    query.canteen = canteen;
     if (status)     query.status  = status;
     if (searchTerm) query.$or = [
@@ -221,15 +223,14 @@ app.get(route('/api/complaints'), async (req, res) => {
       { personalNumber:   new RegExp(searchTerm, 'i') },
       { complaintDetails: new RegExp(searchTerm, 'i') }
     ];
-    const complaints = await Complaint.find(query).sort({ submittedAt: -1 });
-    res.json(complaints);
+    res.json(await Complaint.find(query).sort({ submittedAt: -1 }));
   } catch (e) {
     console.error('Fetch complaints error:', e);
     res.status(500).json({ error: 'Error fetching complaints: ' + e.message });
   }
 });
 
-app.get(route('/api/complaints/:id'), async (req, res) => {
+app.get('/api/complaints/:id', async (req, res) => {
   try {
     const c = await Complaint.findById(req.params.id);
     if (!c) return res.status(404).json({ error: 'Not found' });
@@ -237,9 +238,10 @@ app.get(route('/api/complaints/:id'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error fetching complaint' }); }
 });
 
-app.put(route('/api/complaints/:id'), async (req, res) => {
+app.put('/api/complaints/:id', async (req, res) => {
   try {
     const pin = getHeaderPin(req);
+    console.log(`PUT /complaints — pin received: "${pin}"`);
     if (!await isPinValid(pin))
       return res.status(401).json({ error: 'Unauthorized — invalid PIN' });
 
@@ -253,11 +255,14 @@ app.put(route('/api/complaints/:id'), async (req, res) => {
     const complaint = await Complaint.findByIdAndUpdate(req.params.id, update, { new: true });
     if (!complaint) return res.status(404).json({ error: 'Not found' });
 
-    if (remarks && remarks.trim()) {
-      complaint.remarks.push({ text: remarks.trim(), addedAt: new Date() });
+    if (remarks && String(remarks).trim()) {
+      complaint.remarks.push({ text: String(remarks).trim(), addedAt: new Date() });
       await complaint.save();
     }
-    sendUpdateNotification(complaint).catch(e => console.error('Update email error:', e));
+
+    sendUpdateNotification(complaint).catch(e =>
+      console.error('Update email error:', e.message)
+    );
     res.json({ success: true, complaint });
   } catch (e) {
     console.error('Update complaint error:', e);
@@ -265,7 +270,7 @@ app.put(route('/api/complaints/:id'), async (req, res) => {
   }
 });
 
-app.delete(route('/api/complaints/:id'), async (req, res) => {
+app.delete('/api/complaints/:id', async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
@@ -275,13 +280,13 @@ app.delete(route('/api/complaints/:id'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error deleting complaint' }); }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
 // ADMIN LOGIN
-// ══════════════════════════════════════════════════════════════════════════════
-app.post(route('/api/admin/verify-pin'), async (req, res) => {
+// ════════════════════════════════════════════════════════
+app.post('/api/admin/verify-pin', async (req, res) => {
   try {
     const { pin, username } = req.body;
-    console.log(`Login attempt — user:"${username}" (pin length: ${String(pin||'').length})`);
+    console.log(`Login attempt — user:"${username}" pin length:${String(pin||'').length}`);
 
     const result = await verifyLogin(pin, username);
     console.log(`Login result: valid=${result.valid} superAdmin=${result.isSuperAdmin}`);
@@ -297,12 +302,13 @@ app.post(route('/api/admin/verify-pin'), async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
 // ADMIN STATS
-// ══════════════════════════════════════════════════════════════════════════════
-app.get(route('/api/admin/stats'), async (req, res) => {
+// ════════════════════════════════════════════════════════
+app.get('/api/admin/stats', async (req, res) => {
   try {
     const pin = getHeaderPin(req);
+    console.log(`GET /admin/stats — pin: "${pin}"`);
     if (!await isPinValid(pin))
       return res.status(401).json({ error: 'Unauthorized' });
 
@@ -326,10 +332,10 @@ app.get(route('/api/admin/stats'), async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
 // EMAIL CONFIG
-// ══════════════════════════════════════════════════════════════════════════════
-app.get(route('/api/admin/email-config'), async (req, res) => {
+// ════════════════════════════════════════════════════════
+app.get('/api/admin/email-config', async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
@@ -340,7 +346,7 @@ app.get(route('/api/admin/email-config'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error fetching email config' }); }
 });
 
-app.put(route('/api/admin/email-config'), async (req, res) => {
+app.put('/api/admin/email-config', async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
@@ -354,10 +360,10 @@ app.put(route('/api/admin/email-config'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error updating email config' }); }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
 // SUB-USER MANAGEMENT
-// ══════════════════════════════════════════════════════════════════════════════
-app.get(route('/api/admin/users'), async (req, res) => {
+// ════════════════════════════════════════════════════════
+app.get('/api/admin/users', async (req, res) => {
   try {
     const { pin, username } = req.query;
     const result = await verifyLogin(pin, username);
@@ -368,7 +374,7 @@ app.get(route('/api/admin/users'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error fetching users' }); }
 });
 
-app.post(route('/api/admin/users'), async (req, res) => {
+app.post('/api/admin/users', async (req, res) => {
   try {
     const { pin, username, newUsername, newPin } = req.body;
     const result = await verifyLogin(pin, username);
@@ -379,7 +385,7 @@ app.post(route('/api/admin/users'), async (req, res) => {
       return res.status(400).json({ error: 'Username and PIN required' });
     if (String(newPin).length < 4)
       return res.status(400).json({ error: 'PIN must be at least 4 digits' });
-    if (String(newUsername).trim().toLowerCase() === PERMANENT_USER)
+    if (String(newUsername).trim().toLowerCase() === SUPERADMIN_USER)
       return res.status(400).json({ error: 'Cannot use reserved username' });
 
     const exists = await SubUser.findOne({ username: String(newUsername).trim().toLowerCase() });
@@ -397,7 +403,7 @@ app.post(route('/api/admin/users'), async (req, res) => {
   }
 });
 
-app.delete(route('/api/admin/users/:target'), async (req, res) => {
+app.delete('/api/admin/users/:target', async (req, res) => {
   try {
     const { pin, username } = req.body;
     const result = await verifyLogin(pin, username);
@@ -408,9 +414,9 @@ app.delete(route('/api/admin/users/:target'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error removing user' }); }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
 // OTP / FORGOT PIN / RESET PIN
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
 async function generateAndSendOtp() {
   await OTP.deleteMany({});
   const code      = Math.floor(100000 + Math.random() * 900000).toString();
@@ -421,8 +427,8 @@ async function generateAndSendOtp() {
     to:      ADMIN_EMAIL,
     subject: '🔐 FFC MM — Verification Code',
     html: `
-      <div style="font-family:Arial,sans-serif;max-width:460px;margin:0 auto;padding:28px;
-                  border:1px solid #ddd;border-radius:10px">
+      <div style="font-family:Arial,sans-serif;max-width:460px;margin:0 auto;
+                  padding:28px;border:1px solid #ddd;border-radius:10px">
         <h2 style="color:#a83030;margin:0 0 8px">FFC MM Canteens</h2>
         <p style="color:#444;margin:0 0 24px">Your one-time verification code:</p>
         <div style="background:#fdf3dc;border:2px solid #c8960a;border-radius:8px;
@@ -431,23 +437,27 @@ async function generateAndSendOtp() {
             ${code}
           </span>
         </div>
-        <p style="color:#888;font-size:13px;margin:0">Expires in <strong>10 minutes</strong>.</p>
+        <p style="color:#888;font-size:13px;margin:0">
+          Expires in <strong>10 minutes</strong>.
+        </p>
       </div>`
   });
   return true;
 }
 
-app.post(route('/api/admin/forgot-pin'), async (req, res) => {
+app.post('/api/admin/forgot-pin', async (req, res) => {
   try {
     await generateAndSendOtp();
     res.json({ success: true, message: `Code sent to ${ADMIN_EMAIL}` });
   } catch (e) {
     console.error('OTP send error:', e);
-    res.status(500).json({ error: 'Failed to send code. Check EMAIL_USER / EMAIL_PASSWORD env vars. Error: ' + e.message });
+    res.status(500).json({
+      error: 'Failed to send code. Check EMAIL_USER / EMAIL_PASSWORD env vars. Error: ' + e.message
+    });
   }
 });
 
-app.post(route('/api/admin/verify-otp'), async (req, res) => {
+app.post('/api/admin/verify-otp', async (req, res) => {
   try {
     const { otp } = req.body;
     const record  = await OTP.findOne({ code: String(otp).trim(), used: false });
@@ -459,7 +469,7 @@ app.post(route('/api/admin/verify-otp'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error verifying OTP' }); }
 });
 
-app.post(route('/api/admin/reset-pin'), async (req, res) => {
+app.post('/api/admin/reset-pin', async (req, res) => {
   try {
     const { otp, newPin } = req.body;
     if (!otp || !newPin)           return res.status(400).json({ error: 'OTP and new PIN required' });
@@ -482,12 +492,12 @@ app.post(route('/api/admin/reset-pin'), async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
 // EMAIL HELPERS
-// ══════════════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════
 async function sendComplaintNotification(complaint) {
   const config = await EmailConfig.findOne();
-  if (!config || !config.enableNotifications || !config.recipients.length) return;
+  if (!config || !config.enableNotifications || !config.recipients || !config.recipients.length) return;
   await transporter.sendMail({
     from:    process.env.EMAIL_USER,
     to:      config.recipients.join(', '),
@@ -498,14 +508,13 @@ async function sendComplaintNotification(complaint) {
            <p><strong>P. No:</strong> ${complaint.personalNumber}</p>
            <p><strong>Department:</strong> ${complaint.department}</p>
            <p><strong>Mobile:</strong> ${complaint.mobileNumber}</p>
-           <p><strong>Complaint:</strong><br>${complaint.complaintDetails.replace(/\n/g,'<br>')}</p>
+           <p><strong>Complaint:</strong><br>${complaint.complaintDetails.replace(/\n/g, '<br>')}</p>
            <p><strong>Status:</strong> ${complaint.status}</p>
            <p><strong>ID:</strong> ${complaint._id}</p>`
   });
 }
 
 async function sendUpdateNotification(complaint) {
-  // Only send if mobileNumber looks like an email
   if (!complaint.mobileNumber || !complaint.mobileNumber.includes('@')) return;
   await transporter.sendMail({
     from:    process.env.EMAIL_USER,
