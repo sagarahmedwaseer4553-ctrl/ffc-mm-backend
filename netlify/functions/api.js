@@ -48,11 +48,10 @@ const emailConfigSchema = new mongoose.Schema({
 
 const otpSchema = new mongoose.Schema({
   code:      { type: String, required: true },
-  expiresAt: { type: Date,   required: true },
+  expiresAt: { type: Date, required: true },
   used:      { type: Boolean, default: false }
 });
 
-// Sub-users stored in MongoDB — this is the fix for login issue
 const subUserSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true, lowercase: true, trim: true },
   pin:      { type: String, required: true, trim: true }
@@ -76,59 +75,99 @@ app.use(async (req, res, next) => {
 });
 
 // ── Constants ─────────────────────────────────────────────
+// These are hardcoded — never rely on env for superadmin credentials
 const PERMANENT_USER = 'kingsman';
 const PERMANENT_PIN  = '1920';
 const ADMIN_EMAIL    = 'sagarahmedwaseer4553@gmail.com';
 
-// ── Auth helpers ──────────────────────────────────────────
-function getPinHeader(req) {
-  return req.headers['adminpin'] || req.headers['adminPin'] ||
-         req.headers['admin-pin'] || req.headers['Admin-Pin'] || '';
-}
+/*
+ * THE CORE AUTH FUNCTION
+ * Accepts a single PIN and checks ALL valid sources.
+ * No username required for header-based dashboard auth.
+ * Username only used for login to determine super-admin status.
+ */
+async function isPinValid(pin) {
+  const p = String(pin || '').trim();
+  if (!p) return false;
 
-// Full PIN verification — checks ALL sources
-async function isValidPin(pin, username) {
-  const cleanPin  = String(pin || '').trim();
-  const cleanUser = String(username || '').trim().toLowerCase();
+  // 1. Kingsman permanent PIN
+  if (p === PERMANENT_PIN) return true;
 
-  if (!cleanPin) return false;
+  // 2. Env ADMIN_PIN (legacy)
+  const envPin = String(process.env.ADMIN_PIN || '').trim();
+  if (envPin && p === envPin) return true;
 
-  // 1. Permanent superadmin
-  if (cleanUser === PERMANENT_USER && cleanPin === PERMANENT_PIN) return true;
-
-  // 2. Env ADMIN_PIN (legacy fallback)
-  const envPin = String(process.env.ADMIN_PIN || '1914').trim();
-  if (cleanPin === envPin) return true;
-
-  // 3. DB override PIN (set via forgot-pin flow)
+  // 3. DB override PIN (set via forgot-pin)
   try {
-    const config = await EmailConfig.findOne();
-    if (config && config.adminPinOverride &&
-        cleanPin === String(config.adminPinOverride).trim()) return true;
+    const cfg = await EmailConfig.findOne();
+    if (cfg && cfg.adminPinOverride && p === String(cfg.adminPinOverride).trim()) return true;
   } catch (e) { /* ignore */ }
 
-  // 4. Sub-users stored in MongoDB — THE FIX
+  // 4. Sub-user PIN (any sub-user's PIN works for dashboard access)
   try {
-    const sub = await SubUser.findOne({ username: cleanUser });
-    if (sub && cleanPin === String(sub.pin).trim()) return true;
+    const sub = await SubUser.findOne({ pin: p });
+    if (sub) return true;
   } catch (e) { /* ignore */ }
 
   return false;
 }
 
-// For header-based auth (dashboard requests), pin alone is enough
-async function isValidPinHeader(req) {
-  const pin = getPinHeader(req);
-  return await isValidPin(pin, '');
+/*
+ * LOGIN VERIFICATION
+ * Returns { valid, isSuperAdmin }
+ * Checks username+pin combo to determine role.
+ */
+async function verifyLogin(pin, username) {
+  const p = String(pin || '').trim();
+  const u = String(username || '').trim().toLowerCase();
+
+  if (!p || !u) return { valid: false, isSuperAdmin: false };
+
+  // Permanent superadmin
+  if (u === PERMANENT_USER && p === PERMANENT_PIN) {
+    return { valid: true, isSuperAdmin: true };
+  }
+
+  // Env ADMIN_PIN (legacy — treated as superadmin)
+  const envPin = String(process.env.ADMIN_PIN || '').trim();
+  if (envPin && p === envPin) {
+    return { valid: true, isSuperAdmin: true };
+  }
+
+  // DB override PIN
+  try {
+    const cfg = await EmailConfig.findOne();
+    if (cfg && cfg.adminPinOverride && p === String(cfg.adminPinOverride).trim()) {
+      return { valid: true, isSuperAdmin: false };
+    }
+  } catch (e) { /* ignore */ }
+
+  // Sub-user: username AND pin must match
+  try {
+    const sub = await SubUser.findOne({ username: u, pin: p });
+    if (sub) return { valid: true, isSuperAdmin: false };
+  } catch (e) { /* ignore */ }
+
+  return { valid: false, isSuperAdmin: false };
+}
+
+// Get PIN from request headers (any casing)
+function getHeaderPin(req) {
+  return req.headers['adminpin'] ||
+         req.headers['adminPin'] ||
+         req.headers['admin-pin'] ||
+         req.headers['Admin-Pin'] || '';
 }
 
 // ══════════════════════════════════════════════════════════
 // HEALTH
 // ══════════════════════════════════════════════════════════
-app.get('/api/health', (req, res) => res.json({ status: 'Server running ✅' }));
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'Server running ✅', timestamp: new Date().toISOString() });
+});
 
 // ══════════════════════════════════════════════════════════
-// COMPLAINTS
+// COMPLAINTS — public read, pin-protected write
 // ══════════════════════════════════════════════════════════
 app.post('/api/complaints', async (req, res) => {
   try {
@@ -142,12 +181,18 @@ app.post('/api/complaints', async (req, res) => {
     const complaint = await new Complaint({
       fullName, personalNumber, designation, department,
       mobileNumber, complaintDetails, canteen,
-      imageUrl: imageUrl || null, videoUrl: videoUrl || null,
-      status: 'New', submittedAt: new Date()
+      imageUrl: imageUrl || null,
+      videoUrl: videoUrl || null,
+      status: 'New',
+      submittedAt: new Date()
     }).save();
 
     sendComplaintNotification(complaint);
-    res.status(201).json({ success: true, message: 'Complaint submitted successfully', complaintId: complaint._id });
+    res.status(201).json({
+      success: true,
+      message: 'Complaint submitted successfully',
+      complaintId: complaint._id
+    });
   } catch (e) {
     console.error('Submit error:', e);
     res.status(500).json({ error: 'Error submitting complaint' });
@@ -161,8 +206,8 @@ app.get('/api/complaints', async (req, res) => {
     if (canteen)    query.canteen = canteen;
     if (status)     query.status  = status;
     if (searchTerm) query.$or = [
-      { fullName: new RegExp(searchTerm, 'i') },
-      { personalNumber: new RegExp(searchTerm, 'i') },
+      { fullName:         new RegExp(searchTerm, 'i') },
+      { personalNumber:   new RegExp(searchTerm, 'i') },
       { complaintDetails: new RegExp(searchTerm, 'i') }
     ];
     res.json(await Complaint.find(query).sort({ submittedAt: -1 }));
@@ -179,7 +224,8 @@ app.get('/api/complaints/:id', async (req, res) => {
 
 app.put('/api/complaints/:id', async (req, res) => {
   try {
-    if (!await isValidPinHeader(req))
+    const pin = getHeaderPin(req);
+    if (!await isPinValid(pin))
       return res.status(401).json({ error: 'Unauthorized' });
 
     const { status, remarks, fineAmount, investigation } = req.body;
@@ -203,7 +249,8 @@ app.put('/api/complaints/:id', async (req, res) => {
 
 app.delete('/api/complaints/:id', async (req, res) => {
   try {
-    if (!await isValidPinHeader(req))
+    const pin = getHeaderPin(req);
+    if (!await isPinValid(pin))
       return res.status(401).json({ error: 'Unauthorized' });
     await Complaint.findByIdAndDelete(req.params.id);
     res.json({ success: true, message: 'Complaint deleted' });
@@ -211,29 +258,34 @@ app.delete('/api/complaints/:id', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════
-// ADMIN AUTH
+// ADMIN LOGIN
 // ══════════════════════════════════════════════════════════
 app.post('/api/admin/verify-pin', async (req, res) => {
-  const { pin, username } = req.body;
-  console.log(`Login — user:"${username}" pin:"${pin}"`);
+  try {
+    const { pin, username } = req.body;
+    console.log(`Login attempt — user:"${username}" pin:"${pin}"`);
 
-  const valid  = await isValidPin(pin, username);
-  const isSuper = String(username || '').trim().toLowerCase() === PERMANENT_USER &&
-                  String(pin || '').trim() === PERMANENT_PIN;
+    const result = await verifyLogin(pin, username);
+    console.log(`Login result:`, result);
 
-  if (valid) {
-    res.json({ success: true, token: 'admin_authenticated', isSuperAdmin: isSuper });
-  } else {
-    res.status(401).json({ error: 'Invalid username or PIN' });
+    if (result.valid) {
+      res.json({ success: true, isSuperAdmin: result.isSuperAdmin });
+    } else {
+      res.status(401).json({ error: 'Invalid username or PIN' });
+    }
+  } catch (e) {
+    console.error('Login error:', e);
+    res.status(500).json({ error: 'Login error: ' + e.message });
   }
 });
 
 // ══════════════════════════════════════════════════════════
-// STATS
+// ADMIN STATS
 // ══════════════════════════════════════════════════════════
 app.get('/api/admin/stats', async (req, res) => {
   try {
-    if (!await isValidPinHeader(req))
+    const pin = getHeaderPin(req);
+    if (!await isPinValid(pin))
       return res.status(401).json({ error: 'Unauthorized' });
 
     const [total, newC, inProg, resolved, byCanteen] = await Promise.all([
@@ -243,8 +295,13 @@ app.get('/api/admin/stats', async (req, res) => {
       Complaint.countDocuments({ status: 'Resolved' }),
       Complaint.aggregate([{ $group: { _id: '$canteen', count: { $sum: 1 } } }])
     ]);
-    res.json({ totalComplaints: total, newComplaints: newC,
-               inProgressComplaints: inProg, resolvedComplaints: resolved, byCanteen });
+    res.json({
+      totalComplaints:       total,
+      newComplaints:         newC,
+      inProgressComplaints:  inProg,
+      resolvedComplaints:    resolved,
+      byCanteen
+    });
   } catch (e) { res.status(500).json({ error: 'Error fetching stats' }); }
 });
 
@@ -253,7 +310,8 @@ app.get('/api/admin/stats', async (req, res) => {
 // ══════════════════════════════════════════════════════════
 app.get('/api/admin/email-config', async (req, res) => {
   try {
-    if (!await isValidPinHeader(req))
+    const pin = getHeaderPin(req);
+    if (!await isPinValid(pin))
       return res.status(401).json({ error: 'Unauthorized' });
     let config = await EmailConfig.findOne();
     if (!config) config = await new EmailConfig({ recipients: [], enableNotifications: true }).save();
@@ -263,7 +321,8 @@ app.get('/api/admin/email-config', async (req, res) => {
 
 app.put('/api/admin/email-config', async (req, res) => {
   try {
-    if (!await isValidPinHeader(req))
+    const pin = getHeaderPin(req);
+    if (!await isPinValid(pin))
       return res.status(401).json({ error: 'Unauthorized' });
     const { recipients, enableNotifications } = req.body;
     let config = await EmailConfig.findOne() || new EmailConfig();
@@ -275,31 +334,25 @@ app.put('/api/admin/email-config', async (req, res) => {
 });
 
 // ══════════════════════════════════════════════════════════
-// SUB-USER MANAGEMENT (MongoDB-backed — THE FIX)
+// SUB-USER MANAGEMENT
 // ══════════════════════════════════════════════════════════
-
-// Get all sub-users (superadmin only)
 app.get('/api/admin/users', async (req, res) => {
   try {
     const { pin, username } = req.query;
-    if (!await isValidPin(pin, username) ||
-        String(username).trim().toLowerCase() !== PERMANENT_USER)
-      return res.status(401).json({ error: 'Unauthorized — superadmin only' });
-
-    const users = await SubUser.find({}, { pin: 0 }); // never return pins
+    const result = await verifyLogin(pin, username);
+    if (!result.valid || !result.isSuperAdmin)
+      return res.status(401).json({ error: 'Superadmin only' });
+    const users = await SubUser.find({}, { pin: 0 });
     res.json(users);
   } catch (e) { res.status(500).json({ error: 'Error fetching users' }); }
 });
 
-// Add sub-user
 app.post('/api/admin/users', async (req, res) => {
   try {
     const { pin, username, newUsername, newPin } = req.body;
-
-    // Only kingsman can add users
-    if (!await isValidPin(pin, username) ||
-        String(username).trim().toLowerCase() !== PERMANENT_USER)
-      return res.status(401).json({ error: 'Unauthorized — superadmin only' });
+    const result = await verifyLogin(pin, username);
+    if (!result.valid || !result.isSuperAdmin)
+      return res.status(401).json({ error: 'Superadmin only' });
 
     if (!newUsername || !newPin)
       return res.status(400).json({ error: 'Username and PIN required' });
@@ -308,45 +361,40 @@ app.post('/api/admin/users', async (req, res) => {
     if (String(newUsername).trim().toLowerCase() === PERMANENT_USER)
       return res.status(400).json({ error: 'Cannot use reserved username' });
 
-    const existing = await SubUser.findOne({ username: String(newUsername).trim().toLowerCase() });
-    if (existing)
-      return res.status(400).json({ error: 'Username already exists' });
+    const exists = await SubUser.findOne({ username: String(newUsername).trim().toLowerCase() });
+    if (exists) return res.status(400).json({ error: 'Username already exists' });
 
     await new SubUser({
       username: String(newUsername).trim().toLowerCase(),
       pin:      String(newPin).trim()
     }).save();
 
-    res.json({ success: true, message: `User "${newUsername}" added successfully` });
+    res.json({ success: true, message: `User "${newUsername}" added` });
   } catch (e) {
     console.error('Add user error:', e);
     res.status(500).json({ error: 'Error adding user' });
   }
 });
 
-// Remove sub-user
-app.delete('/api/admin/users/:targetUsername', async (req, res) => {
+app.delete('/api/admin/users/:target', async (req, res) => {
   try {
     const { pin, username } = req.body;
-
-    if (!await isValidPin(pin, username) ||
-        String(username).trim().toLowerCase() !== PERMANENT_USER)
-      return res.status(401).json({ error: 'Unauthorized — superadmin only' });
-
-    await SubUser.findOneAndDelete({ username: req.params.targetUsername.toLowerCase() });
-    res.json({ success: true, message: 'User removed' });
+    const result = await verifyLogin(pin, username);
+    if (!result.valid || !result.isSuperAdmin)
+      return res.status(401).json({ error: 'Superadmin only' });
+    await SubUser.findOneAndDelete({ username: req.params.target.toLowerCase() });
+    res.json({ success: true });
   } catch (e) { res.status(500).json({ error: 'Error removing user' }); }
 });
 
 // ══════════════════════════════════════════════════════════
-// OTP / FORGOT PIN
+// OTP / FORGOT PIN / RESET PIN
 // ══════════════════════════════════════════════════════════
 async function generateAndSendOtp() {
   await OTP.deleteMany({});
   const code      = Math.floor(100000 + Math.random() * 900000).toString();
   const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
   await new OTP({ code, expiresAt }).save();
-
   await transporter.sendMail({
     from:    process.env.EMAIL_USER,
     to:      ADMIN_EMAIL,
@@ -362,11 +410,10 @@ async function generateAndSendOtp() {
             ${code}
           </span>
         </div>
-        <p style="color:#888;font-size:13px;margin:0">
-          Expires in <strong>10 minutes</strong>.
-        </p>
+        <p style="color:#888;font-size:13px;margin:0">Expires in <strong>10 minutes</strong>.</p>
       </div>`
   });
+  return true;
 }
 
 app.post('/api/admin/forgot-pin', async (req, res) => {
@@ -374,12 +421,11 @@ app.post('/api/admin/forgot-pin', async (req, res) => {
     await generateAndSendOtp();
     res.json({ success: true, message: `Code sent to ${ADMIN_EMAIL}` });
   } catch (e) {
-    console.error('OTP send error:', e);
-    res.status(500).json({ error: 'Failed to send code. Check EMAIL_USER and EMAIL_PASSWORD.' });
+    console.error('OTP error:', e);
+    res.status(500).json({ error: 'Failed to send code. Check EMAIL_USER and EMAIL_PASSWORD env vars.' });
   }
 });
 
-// Verify OTP only (used for user management actions)
 app.post('/api/admin/verify-otp', async (req, res) => {
   try {
     const { otp } = req.body;
@@ -401,7 +447,6 @@ app.post('/api/admin/reset-pin', async (req, res) => {
     const record = await OTP.findOne({ code: String(otp).trim(), used: false });
     if (!record)                       return res.status(400).json({ error: 'Invalid code' });
     if (new Date() > record.expiresAt) return res.status(400).json({ error: 'Code expired' });
-
     record.used = true;
     await record.save();
 
@@ -424,8 +469,8 @@ async function sendComplaintNotification(complaint) {
     const config = await EmailConfig.findOne();
     if (!config || !config.enableNotifications || !config.recipients.length) return;
     await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to:   config.recipients.join(', '),
+      from:    process.env.EMAIL_USER,
+      to:      config.recipients.join(', '),
       subject: `🔔 New Complaint — ${complaint.canteen}`,
       html: `<h2>New Complaint Received</h2>
              <p><strong>Canteen:</strong> ${complaint.canteen}</p>
@@ -444,8 +489,8 @@ async function sendUpdateNotification(complaint) {
   try {
     if (!complaint.mobileNumber.includes('@')) return;
     await transporter.sendMail({
-      from: process.env.EMAIL_USER,
-      to:   complaint.mobileNumber,
+      from:    process.env.EMAIL_USER,
+      to:      complaint.mobileNumber,
       subject: `📋 Complaint Update — ${complaint.canteen}`,
       html: `<h2>Status Update</h2>
              <p><strong>Status:</strong> ${complaint.status}</p>
