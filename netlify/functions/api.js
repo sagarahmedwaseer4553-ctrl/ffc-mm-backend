@@ -6,43 +6,35 @@ const nodemailer = require('nodemailer');
 
 const app = express();
 
-// ─── CRITICAL FIX 1 — CORS ───────────────────────────────────────────────────
-// FRONTEND_URL env var is "https://canteens-ffcmm.netlify.app/" (trailing slash).
-// The cors package does an EXACT string match against the browser's Origin header.
-// Browsers send Origin WITHOUT a trailing slash: "https://canteens-ffcmm.netlify.app"
-// So the match was FAILING → every preflight was rejected → ALL requests blocked.
-// Fix: strip trailing slashes before passing to cors().
-// ─────────────────────────────────────────────────────────────────────────────
+// ─── CORS ─────────────────────────────────────────────────────────────────────
+// Strip trailing slashes — browsers send Origin without trailing slash
 const _frontendOrigin = (process.env.FRONTEND_URL || 'http://localhost:3000').replace(/\/+$/, '');
 
 app.use(cors({
   origin: [
     _frontendOrigin,
-    'http://localhost:3000',          // local dev
-    'https://canteens-ffcmm.netlify.app'  // hard-coded fallback in case env is wrong
+    'http://localhost:3000',
+    'https://canteens-ffcmm.netlify.app'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'adminpin', 'AdminPin', 'admin-pin', 'Admin-Pin']
+  allowedHeaders: ['Content-Type', 'adminpin', 'AdminPin', 'admin-pin', 'Admin-Pin', 'Authorization']
 }));
 
-// Handle OPTIONS preflight for all routes
 app.options('*', cors());
-
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// ── DB ────────────────────────────────────────────────────
+// ── DB ────────────────────────────────────────────────────────────────────────
 let isConnected = false;
 async function connectDB() {
   if (isConnected) return;
-  await mongoose.connect(process.env.MONGODB_URI, {
-    useNewUrlParser: true, useUnifiedTopology: true
-  });
+  await mongoose.connect(process.env.MONGODB_URI);
   isConnected = true;
+  console.log('✅ MongoDB connected');
 }
 
-// ── Schemas ───────────────────────────────────────────────
+// ── Schemas ───────────────────────────────────────────────────────────────────
 const complaintSchema = new mongoose.Schema({
   fullName:         { type: String, required: true },
   personalNumber:   { type: String, required: true },
@@ -84,47 +76,46 @@ const EmailConfig = mongoose.models.EmailConfig || mongoose.model('EmailConfig',
 const OTP         = mongoose.models.OTP         || mongoose.model('OTP',         otpSchema);
 const SubUser     = mongoose.models.SubUser     || mongoose.model('SubUser',     subUserSchema);
 
-// ── Email ─────────────────────────────────────────────────
+// ── Email transporter ─────────────────────────────────────────────────────────
 const transporter = nodemailer.createTransport({
   service: 'gmail',
   auth: { user: process.env.EMAIL_USER, pass: process.env.EMAIL_PASSWORD }
 });
 
-// ── DB middleware ─────────────────────────────────────────
+// ── DB middleware ─────────────────────────────────────────────────────────────
 app.use(async (req, res, next) => {
   try { await connectDB(); next(); }
-  catch (e) { res.status(500).json({ error: 'Database connection failed' }); }
+  catch (e) {
+    console.error('DB connect error:', e.message);
+    res.status(500).json({ error: 'Database connection failed: ' + e.message });
+  }
 });
 
-// ── Constants ─────────────────────────────────────────────
-const PERMANENT_USER = 'kingsman';
-const PERMANENT_PIN  = '1920';
-const ADMIN_EMAIL    = 'sagarahmedwaseer4553@gmail.com';
+// ── Constants ─────────────────────────────────────────────────────────────────
+// FIXED: Use PERMANENT_USER + env ADMIN_PIN as the superadmin credentials.
+// The hard-coded fallback PIN matches what is set in Netlify env vars.
+const PERMANENT_USER     = 'kingsman';
+const PERMANENT_PIN_HARD = '1914';   // fallback if env var missing
+const ADMIN_EMAIL        = 'sagarahmedwaseer4553@gmail.com';
 
-// ─── CRITICAL FIX 2 — ROUTE PATH NORMALISATION ───────────────────────────────
-// Netlify redirects: from="/api/*" to="/.netlify/functions/api/:splat"
-// Depending on serverless-http version, Express may see the path with OR without
-// the /api prefix.  We register BOTH so it always works:
-//   /api/complaints  (original path preserved by some serverless-http versions)
-//   /complaints      (splat only, passed by other versions)
-// ─────────────────────────────────────────────────────────────────────────────
+function getPermanentPin() {
+  // Prefer env var so it can be changed without redeploying
+  return (process.env.ADMIN_PIN || PERMANENT_PIN_HARD).trim();
+}
+
+// ── Route helper: register both /api/X and /X so it works regardless of
+//    how serverless-http strips (or doesn't strip) the function path prefix.
 function route(path) {
-  // path must start with /api/... — we also register the version without /api
   const withoutPrefix = path.replace(/^\/api/, '') || '/';
   return [path, withoutPrefix];
 }
 
-/*
- * THE CORE AUTH FUNCTION
- */
+// ── Auth helpers ──────────────────────────────────────────────────────────────
 async function isPinValid(pin) {
   const p = String(pin || '').trim();
   if (!p) return false;
 
-  if (p === PERMANENT_PIN) return true;
-
-  const envPin = String(process.env.ADMIN_PIN || '').trim();
-  if (envPin && p === envPin) return true;
+  if (p === getPermanentPin()) return true;
 
   try {
     const cfg = await EmailConfig.findOne();
@@ -142,29 +133,24 @@ async function isPinValid(pin) {
 async function verifyLogin(pin, username) {
   const p = String(pin || '').trim();
   const u = String(username || '').trim().toLowerCase();
-
   if (!p || !u) return { valid: false, isSuperAdmin: false };
 
-  // Permanent superadmin
-  if (u === PERMANENT_USER && p === PERMANENT_PIN) {
+  // Superadmin: username must be 'kingsman' AND pin must match permanent pin
+  if (u === PERMANENT_USER && p === getPermanentPin()) {
     return { valid: true, isSuperAdmin: true };
   }
 
-  // Env ADMIN_PIN (legacy — treated as superadmin)
-  const envPin = String(process.env.ADMIN_PIN || '').trim();
-  if (envPin && p === envPin) {
-    return { valid: true, isSuperAdmin: true };
-  }
-
-  // DB override PIN
+  // DB override PIN (used after forgot-pin reset)
   try {
     const cfg = await EmailConfig.findOne();
     if (cfg && cfg.adminPinOverride && p === String(cfg.adminPinOverride).trim()) {
+      // If username is also kingsman treat as superadmin
+      if (u === PERMANENT_USER) return { valid: true, isSuperAdmin: true };
       return { valid: true, isSuperAdmin: false };
     }
   } catch (e) { /* ignore */ }
 
-  // Sub-user: username AND pin must match
+  // Sub-user: both username AND pin must match
   try {
     const sub = await SubUser.findOne({ username: u, pin: p });
     if (sub) return { valid: true, isSuperAdmin: false };
@@ -173,24 +159,25 @@ async function verifyLogin(pin, username) {
   return { valid: false, isSuperAdmin: false };
 }
 
-// Get PIN from request headers (any casing)
 function getHeaderPin(req) {
-  return req.headers['adminpin'] ||
-         req.headers['adminPin'] ||
-         req.headers['admin-pin'] ||
-         req.headers['Admin-Pin'] || '';
+  return (
+    req.headers['adminpin'] ||
+    req.headers['adminPin'] ||
+    req.headers['admin-pin'] ||
+    req.headers['Admin-Pin'] || ''
+  );
 }
 
-// ══════════════════════════════════════════════════════════
-// HEALTH
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+// HEALTH CHECK
+// ══════════════════════════════════════════════════════════════════════════════
 app.get(route('/api/health'), (req, res) => {
   res.json({ status: 'Server running ✅', timestamp: new Date().toISOString() });
 });
 
-// ══════════════════════════════════════════════════════════
-// COMPLAINTS
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
+// COMPLAINTS — PUBLIC (no auth needed for GET/POST)
+// ══════════════════════════════════════════════════════════════════════════════
 app.post(route('/api/complaints'), async (req, res) => {
   try {
     const { fullName, personalNumber, designation, department,
@@ -209,15 +196,17 @@ app.post(route('/api/complaints'), async (req, res) => {
       submittedAt: new Date()
     }).save();
 
-    sendComplaintNotification(complaint);
+    // Fire and forget — don't await so it doesn't slow response
+    sendComplaintNotification(complaint).catch(e => console.error('Email notify error:', e));
+
     res.status(201).json({
       success: true,
       message: 'Complaint submitted successfully',
       complaintId: complaint._id
     });
   } catch (e) {
-    console.error('Submit error:', e);
-    res.status(500).json({ error: 'Error submitting complaint' });
+    console.error('Submit complaint error:', e);
+    res.status(500).json({ error: 'Error submitting complaint: ' + e.message });
   }
 });
 
@@ -232,8 +221,12 @@ app.get(route('/api/complaints'), async (req, res) => {
       { personalNumber:   new RegExp(searchTerm, 'i') },
       { complaintDetails: new RegExp(searchTerm, 'i') }
     ];
-    res.json(await Complaint.find(query).sort({ submittedAt: -1 }));
-  } catch (e) { res.status(500).json({ error: 'Error fetching complaints' }); }
+    const complaints = await Complaint.find(query).sort({ submittedAt: -1 });
+    res.json(complaints);
+  } catch (e) {
+    console.error('Fetch complaints error:', e);
+    res.status(500).json({ error: 'Error fetching complaints: ' + e.message });
+  }
 });
 
 app.get(route('/api/complaints/:id'), async (req, res) => {
@@ -248,47 +241,50 @@ app.put(route('/api/complaints/:id'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
-      return res.status(401).json({ error: 'Unauthorized' });
+      return res.status(401).json({ error: 'Unauthorized — invalid PIN' });
 
     const { status, remarks, fineAmount, investigation } = req.body;
     const update = { updatedAt: new Date() };
     if (status !== undefined)        update.status        = status;
-    if (fineAmount !== undefined)    update.fineAmount    = fineAmount;
+    if (fineAmount !== undefined)    update.fineAmount    = parseFloat(fineAmount) || 0;
     if (investigation !== undefined) update.investigation = investigation;
     if (status === 'Resolved')       update.resolvedAt    = new Date();
 
     const complaint = await Complaint.findByIdAndUpdate(req.params.id, update, { new: true });
     if (!complaint) return res.status(404).json({ error: 'Not found' });
 
-    if (remarks) {
-      complaint.remarks.push({ text: remarks, addedAt: new Date() });
+    if (remarks && remarks.trim()) {
+      complaint.remarks.push({ text: remarks.trim(), addedAt: new Date() });
       await complaint.save();
     }
-    sendUpdateNotification(complaint);
+    sendUpdateNotification(complaint).catch(e => console.error('Update email error:', e));
     res.json({ success: true, complaint });
-  } catch (e) { res.status(500).json({ error: 'Error updating complaint' }); }
+  } catch (e) {
+    console.error('Update complaint error:', e);
+    res.status(500).json({ error: 'Error updating complaint: ' + e.message });
+  }
 });
 
 app.delete(route('/api/complaints/:id'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
     if (!await isPinValid(pin))
-      return res.status(401).json({ error: 'Unauthorized' });
+      return res.status(401).json({ error: 'Unauthorized — invalid PIN' });
     await Complaint.findByIdAndDelete(req.params.id);
     res.json({ success: true, message: 'Complaint deleted' });
   } catch (e) { res.status(500).json({ error: 'Error deleting complaint' }); }
 });
 
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 // ADMIN LOGIN
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 app.post(route('/api/admin/verify-pin'), async (req, res) => {
   try {
     const { pin, username } = req.body;
-    console.log(`Login attempt — user:"${username}" pin:"${pin}"`);
+    console.log(`Login attempt — user:"${username}" (pin length: ${String(pin||'').length})`);
 
     const result = await verifyLogin(pin, username);
-    console.log(`Login result:`, result);
+    console.log(`Login result: valid=${result.valid} superAdmin=${result.isSuperAdmin}`);
 
     if (result.valid) {
       res.json({ success: true, isSuperAdmin: result.isSuperAdmin });
@@ -301,9 +297,9 @@ app.post(route('/api/admin/verify-pin'), async (req, res) => {
   }
 });
 
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 // ADMIN STATS
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 app.get(route('/api/admin/stats'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
@@ -318,18 +314,21 @@ app.get(route('/api/admin/stats'), async (req, res) => {
       Complaint.aggregate([{ $group: { _id: '$canteen', count: { $sum: 1 } } }])
     ]);
     res.json({
-      totalComplaints:       total,
-      newComplaints:         newC,
-      inProgressComplaints:  inProg,
-      resolvedComplaints:    resolved,
+      totalComplaints:      total,
+      newComplaints:        newC,
+      inProgressComplaints: inProg,
+      resolvedComplaints:   resolved,
       byCanteen
     });
-  } catch (e) { res.status(500).json({ error: 'Error fetching stats' }); }
+  } catch (e) {
+    console.error('Stats error:', e);
+    res.status(500).json({ error: 'Error fetching stats: ' + e.message });
+  }
 });
 
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 // EMAIL CONFIG
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 app.get(route('/api/admin/email-config'), async (req, res) => {
   try {
     const pin = getHeaderPin(req);
@@ -355,9 +354,9 @@ app.put(route('/api/admin/email-config'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error updating email config' }); }
 });
 
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 // SUB-USER MANAGEMENT
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 app.get(route('/api/admin/users'), async (req, res) => {
   try {
     const { pin, username } = req.query;
@@ -394,7 +393,7 @@ app.post(route('/api/admin/users'), async (req, res) => {
     res.json({ success: true, message: `User "${newUsername}" added` });
   } catch (e) {
     console.error('Add user error:', e);
-    res.status(500).json({ error: 'Error adding user' });
+    res.status(500).json({ error: 'Error adding user: ' + e.message });
   }
 });
 
@@ -409,9 +408,9 @@ app.delete(route('/api/admin/users/:target'), async (req, res) => {
   } catch (e) { res.status(500).json({ error: 'Error removing user' }); }
 });
 
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 // OTP / FORGOT PIN / RESET PIN
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 async function generateAndSendOtp() {
   await OTP.deleteMany({});
   const code      = Math.floor(100000 + Math.random() * 900000).toString();
@@ -443,8 +442,8 @@ app.post(route('/api/admin/forgot-pin'), async (req, res) => {
     await generateAndSendOtp();
     res.json({ success: true, message: `Code sent to ${ADMIN_EMAIL}` });
   } catch (e) {
-    console.error('OTP error:', e);
-    res.status(500).json({ error: 'Failed to send code. Check EMAIL_USER and EMAIL_PASSWORD env vars.' });
+    console.error('OTP send error:', e);
+    res.status(500).json({ error: 'Failed to send code. Check EMAIL_USER / EMAIL_PASSWORD env vars. Error: ' + e.message });
   }
 });
 
@@ -479,47 +478,44 @@ app.post(route('/api/admin/reset-pin'), async (req, res) => {
     res.json({ success: true, message: 'PIN updated! Use your new PIN to login.' });
   } catch (e) {
     console.error('Reset PIN error:', e);
-    res.status(500).json({ error: 'Error resetting PIN' });
+    res.status(500).json({ error: 'Error resetting PIN: ' + e.message });
   }
 });
 
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 // EMAIL HELPERS
-// ══════════════════════════════════════════════════════════
+// ══════════════════════════════════════════════════════════════════════════════
 async function sendComplaintNotification(complaint) {
-  try {
-    const config = await EmailConfig.findOne();
-    if (!config || !config.enableNotifications || !config.recipients.length) return;
-    await transporter.sendMail({
-      from:    process.env.EMAIL_USER,
-      to:      config.recipients.join(', '),
-      subject: `🔔 New Complaint — ${complaint.canteen}`,
-      html: `<h2>New Complaint Received</h2>
-             <p><strong>Canteen:</strong> ${complaint.canteen}</p>
-             <p><strong>Name:</strong> ${complaint.fullName}</p>
-             <p><strong>P. No:</strong> ${complaint.personalNumber}</p>
-             <p><strong>Department:</strong> ${complaint.department}</p>
-             <p><strong>Mobile:</strong> ${complaint.mobileNumber}</p>
-             <p><strong>Complaint:</strong><br>${complaint.complaintDetails}</p>
-             <p><strong>Status:</strong> ${complaint.status}</p>
-             <p>ID: ${complaint._id}</p>`
-    });
-  } catch (e) { console.error('Notification error:', e); }
+  const config = await EmailConfig.findOne();
+  if (!config || !config.enableNotifications || !config.recipients.length) return;
+  await transporter.sendMail({
+    from:    process.env.EMAIL_USER,
+    to:      config.recipients.join(', '),
+    subject: `🔔 New Complaint — ${complaint.canteen}`,
+    html: `<h2>New Complaint Received</h2>
+           <p><strong>Canteen:</strong> ${complaint.canteen}</p>
+           <p><strong>Name:</strong> ${complaint.fullName}</p>
+           <p><strong>P. No:</strong> ${complaint.personalNumber}</p>
+           <p><strong>Department:</strong> ${complaint.department}</p>
+           <p><strong>Mobile:</strong> ${complaint.mobileNumber}</p>
+           <p><strong>Complaint:</strong><br>${complaint.complaintDetails.replace(/\n/g,'<br>')}</p>
+           <p><strong>Status:</strong> ${complaint.status}</p>
+           <p><strong>ID:</strong> ${complaint._id}</p>`
+  });
 }
 
 async function sendUpdateNotification(complaint) {
-  try {
-    if (!complaint.mobileNumber.includes('@')) return;
-    await transporter.sendMail({
-      from:    process.env.EMAIL_USER,
-      to:      complaint.mobileNumber,
-      subject: `📋 Complaint Update — ${complaint.canteen}`,
-      html: `<h2>Status Update</h2>
-             <p><strong>Status:</strong> ${complaint.status}</p>
-             <p><strong>Fine:</strong> ${complaint.fineAmount || 'N/A'}</p>
-             <p><strong>Investigation:</strong> ${complaint.investigation || 'In progress'}</p>`
-    });
-  } catch (e) { console.error('Update email error:', e); }
+  // Only send if mobileNumber looks like an email
+  if (!complaint.mobileNumber || !complaint.mobileNumber.includes('@')) return;
+  await transporter.sendMail({
+    from:    process.env.EMAIL_USER,
+    to:      complaint.mobileNumber,
+    subject: `📋 Complaint Update — ${complaint.canteen}`,
+    html: `<h2>Status Update</h2>
+           <p><strong>Status:</strong> ${complaint.status}</p>
+           <p><strong>Fine:</strong> ${complaint.fineAmount || 'N/A'}</p>
+           <p><strong>Investigation:</strong> ${complaint.investigation || 'In progress'}</p>`
+  });
 }
 
 module.exports.handler = serverless(app);
