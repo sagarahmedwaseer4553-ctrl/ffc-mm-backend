@@ -6,6 +6,13 @@
 [functions]
   node_bundler = "esbuild"
 
+[[headers]]
+  for = "/api/*"
+  [headers.values]
+    Access-Control-Allow-Origin = "https://canteen-ffc.netlify.app"
+    Access-Control-Allow-Methods = "GET, POST, PUT, DELETE, OPTIONS"
+    Access-Control-Allow-Headers = "Content-Type, Authorization, adminpin, AdminPin, admin-pin, Admin-Pin"
+
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/api/:splat"
