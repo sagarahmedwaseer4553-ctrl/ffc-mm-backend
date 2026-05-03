@@ -223,7 +223,9 @@ app.get('/api/complaints', async (req, res) => {
       { personalNumber:   new RegExp(searchTerm, 'i') },
       { complaintDetails: new RegExp(searchTerm, 'i') }
     ];
-    res.json(await Complaint.find(query).sort({ submittedAt: -1 }));
+    res.json(await Complaint.find(query)
+      .select('-imageUrl -videoUrl')
+      .sort({ submittedAt: -1 }));
   } catch (e) {
     console.error('Fetch complaints error:', e);
     res.status(500).json({ error: 'Error fetching complaints: ' + e.message });
